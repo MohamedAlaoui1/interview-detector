@@ -1,0 +1,45 @@
+name: Build and Sync Detector
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build detector.exe
+        run: pyinstaller --onefile main.py --name detector
+
+      - name: Checkout Tauri repo
+        uses: actions/checkout@v4
+        with:
+          repository: MohamedAlaoui1/tauriTest
+          token: ${{ secrets.TAURI_REPO_TOKEN }}
+          path: tauri-repo
+
+      - name: Replace binary in Tauri repo
+        run: |
+          copy dist\detector.exe tauri-repo\src-tauri\binaries\detector-x86_64-pc-windows-msvc.exe
+
+      - name: Push to Tauri repo
+        working-directory: tauri-repo
+        run: |
+          git config user.email "med.sidi.alaoui@gmail.com"
+          git config user.name "Auto Sync"
+          git add src-tauri/binaries/detector-x86_64-pc-windows-msvc.exe
+          git commit -m "update detector binary"
+          git push origin main
