@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 NETWORK_SPIKE_THRESHOLD: float = 500_000       # 500 KB/s — single poll trigger
 NETWORK_ROLLING_THRESHOLD: float = 200_000     # 200 KB/s — rolling avg must also exceed this
-NETWORK_DECAY_SECS: float = 20.0
+NETWORK_DECAY_SECS: float = 120.0              # 2 minutes — covers silent pauses in calls
 NETWORK_ROLLING_POLLS: int = 4                 # ~12 seconds of history
 
 AMPLITUDE_THRESHOLD: float = 200.0
@@ -207,3 +207,13 @@ class AudioWatcher:
                 self._pa.terminate()
         except Exception:
             pass
+
+    def reset_decay_timer(self):
+        """
+        Called by CallScorer when the call window title disappears.
+        Clears the decay timer immediately so the network signal drops to inactive
+        on the next poll rather than waiting up to 120 seconds.
+        """
+        self._last_spike_time = None
+        self._net_history.clear()
+        logger.debug("AudioWatcher: decay timer reset by external signal.")

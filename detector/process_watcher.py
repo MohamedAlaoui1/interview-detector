@@ -3,15 +3,16 @@ process_watcher.py
 
 Window title detection for Teams and Zoom.
 
-Teams:
-  Idle:    "Chat | <name> | Microsoft Teams"
-  On call: "Microsoft Teams"  (exact)
+Teams observed window titles:
+  Idle:    "Chat | <name> | Microsoft Teams"   ← has "Chat |" prefix
+  Idle:    "Microsoft Teams"                   ← main app window
+  On call: "<meeting name> | Microsoft Teams"  ← ends with "| Microsoft Teams", no "Chat |" prefix
+  On call: "Aya Fnichel | Microsoft Teams"     ← 1:1 call, same pattern
 
 Zoom:
-  Idle:    "Zoom Meetings"  (exact)
-  On call: "Zoom Meeting <duration/name>"  (starts with "zoom meeting " + extra)
-
-Score: +1 if any call window title detected (bonus alongside network signal)
+  Idle:    "Zoom Workplace" / "Zoom Meetings"
+  On call: "Zoom Meeting <duration/name>"
+  On call: "ZPToolBarParentWnd" (floating toolbar)
 """
 
 import logging
@@ -19,20 +20,14 @@ import psutil
 
 logger = logging.getLogger(__name__)
 
-# Teams
-TEAMS_CALL_TITLE_EXACT: str = "microsoft teams"
-TEAMS_IDLE_TITLE_MARKERS: list[str] = ["chat |", "| microsoft teams"]
-
 # Zoom — exact titles observed from diagnose_zoom_windows.py
 ZOOM_IDLE_TITLES: set[str] = {"Zoom Workplace", "Zoom Meetings"}
-ZOOM_CALL_TITLES: set[str] = {"Zoom Meeting"}        # exact — appears only during a call
-ZOOM_CALL_TOOLBAR: str = "ZPToolBarParentWnd"        # floating toolbar, only exists on a call
+ZOOM_CALL_TITLES: set[str] = {"Zoom Meeting"}
+ZOOM_CALL_TOOLBAR: str = "ZPToolBarParentWnd"
 
 # Process names
 TEAMS_PROCESS_NAMES = {'ms-teams.exe', 'teams.exe', 'msteams.exe'}
-# psutil returns exact Windows name — Zoom uses capital Z
 ZOOM_PROCESS_NAMES  = {'Zoom.exe'}
-
 
 
 class ProcessSignals:
@@ -53,7 +48,6 @@ class ProcessSignals:
 
     @property
     def active_app(self) -> str | None:
-        """Which app has a call window active right now."""
         if self.teams_call_window_detected:
             return "Microsoft Teams"
         if self.zoom_call_window_detected:
@@ -97,12 +91,36 @@ class ProcessWatcher:
         signals.zoom_process_count = zoom_count
         signals.zoom_is_running = zoom_count >= 1
 
-        # Window title scan — single pass for both apps
         teams_call, zoom_call = self._check_window_titles()
         signals.teams_call_window_detected = teams_call
         signals.zoom_call_window_detected = zoom_call
 
         return signals
+
+    def _is_teams_call_window(self, title: str) -> bool:
+        """
+        Returns True if the window title is a Teams call window.
+
+        Call windows end with "| Microsoft Teams" but do NOT start with "Chat |".
+        Examples that match:
+          "GroupProject(2nd) | Microsoft Teams"
+          "Aya Fnichel | Microsoft Teams"
+        Examples that must NOT match:
+          "Chat | Aya Fnichel | Microsoft Teams"  ← idle chat window
+          "Microsoft Teams"                        ← main app window, not a call
+          "Calendar | Calendar | Microsoft Teams"  ← calendar tab
+        """
+        if not title.endswith("| Microsoft Teams"):
+            return False
+        if title.startswith("Chat |"):
+            return False
+        if title.startswith("Calendar |"):
+            return False
+        # Must have something before "| Microsoft Teams" that isn't just the app name
+        prefix = title[: -len("| Microsoft Teams")].strip().rstrip("|").strip()
+        if not prefix:
+            return False
+        return True
 
     def _check_window_titles(self) -> tuple[bool, bool]:
         """
@@ -123,15 +141,11 @@ class ProcessWatcher:
                     title = win32gui.GetWindowText(hwnd).strip()
                     if not title:
                         return
-                    t_lower = title.lower()
 
-                    # Teams: exactly "microsoft teams" (case-insensitive), no "chat |" prefix
-                    if (not teams_found
-                            and t_lower == TEAMS_CALL_TITLE_EXACT
-                            and not any(m in t_lower for m in TEAMS_IDLE_TITLE_MARKERS)):
+                    if not teams_found and self._is_teams_call_window(title):
                         teams_found = True
+                        logger.debug("ProcessWatcher: Teams call window matched — %r", title)
 
-                    # Zoom: "Zoom Meeting" exact OR toolbar — case-sensitive, from diagnosis
                     if not zoom_found:
                         if title in ZOOM_CALL_TITLES or title == ZOOM_CALL_TOOLBAR:
                             zoom_found = True

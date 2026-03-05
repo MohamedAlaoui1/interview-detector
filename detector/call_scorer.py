@@ -4,19 +4,21 @@ call_scorer.py
 Two separate detection strategies:
 
   TEAMS — Network spike + decay (reliable, 60x gap between idle and call)
-    +2  Teams network spike detected (decay timer active)
+    +2  Teams network spike detected (rolling avg confirmed, decay timer active)
     +1  Teams call window title detected
-    Threshold: 2  →  network alone triggers
+    Threshold: 2  →  network alone triggers, window title alone does NOT
 
   ZOOM — Window title only (network too spiky to use)
-    +2  Zoom call window title detected ("Zoom Meeting <x>", not "Zoom Meetings")
+    +2  Zoom call window title detected
     Threshold: 2  →  window title alone triggers
 
   BOTH — Max score: 3, threshold: 2
 
-Duration gate : 2 consecutive polls above threshold (~6s at 3s interval)
-End grace     : 0 extra polls — decay timer (20s) handles Teams end,
-                window title disappears instantly for Zoom
+Duration gate  : 2 consecutive polls above threshold (~6s) before notifying
+Grace period   : 10 consecutive polls below threshold (~30s) required to end call
+                 BYPASSED instantly if the call window title disappears
+Window hold    : if call window title is still present, score drop is ignored
+Decay timer    : 120s (in audio_watcher) — RESET immediately on window title drop
 """
 
 import time
@@ -31,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 CALL_SCORE_THRESHOLD: int = 2
 DURATION_GATE_POLLS: int = 2
-CALL_END_GRACE_POLLS: int = 0
+CALL_END_GRACE_POLLS: int = 10
 
 
 @dataclass
@@ -68,29 +70,34 @@ class CallScorer:
         self._history: list[CallState] = []
         self._consecutive_active_polls: int = 0
         self._consecutive_inactive_polls: int = 0
+        self._prev_teams_window: bool = False
+        self._prev_zoom_window: bool = False
 
     def _compute_score(self, proc: ProcessSignals, audio: AudioSignals) -> tuple[int, str | None]:
-        """
-        Compute total score and identify which app is on a call.
-        Zoom and Teams scored independently, highest wins.
-        Returns (score, app_name).
-        """
         teams_score = sum([
             2 if audio.teams_network_active else 0,
             1 if proc.teams_call_window_detected else 0,
         ])
-
         zoom_score = sum([
             2 if proc.zoom_call_window_detected else 0,
         ])
-
         if teams_score >= zoom_score and teams_score >= CALL_SCORE_THRESHOLD:
             return teams_score, "Microsoft Teams"
         elif zoom_score >= CALL_SCORE_THRESHOLD:
             return zoom_score, "Zoom"
         else:
-            # Return whichever is higher even if below threshold (for debug)
             return max(teams_score, zoom_score), None
+
+    def _call_should_be_held(self, proc: ProcessSignals) -> bool:
+        """Hold call active if the call window title is still present — covers silent pauses."""
+        app = self._current_state.app_name
+        if app == "Microsoft Teams" and proc.teams_call_window_detected:
+            logger.debug("CallScorer: Teams call window still present — holding call state.")
+            return True
+        if app == "Zoom" and proc.zoom_call_window_detected:
+            logger.debug("CallScorer: Zoom call window still present — holding call state.")
+            return True
+        return False
 
     def evaluate(self) -> CallState:
         proc: ProcessSignals = self.process_watcher.scan()
@@ -100,7 +107,34 @@ class CallScorer:
         now = time.time()
         prev_active = self._current_state.call_active
 
-        if total_score >= CALL_SCORE_THRESHOLD:
+        # Fast-end: call window title just disappeared → end immediately,
+        # don't wait for decay timer (120s) or grace period (30s).
+        teams_window_just_dropped = (
+            prev_active
+            and self._current_state.app_name == "Microsoft Teams"
+            and self._prev_teams_window
+            and not proc.teams_call_window_detected
+        )
+        zoom_window_just_dropped = (
+            prev_active
+            and self._current_state.app_name == "Zoom"
+            and self._prev_zoom_window
+            and not proc.zoom_call_window_detected
+        )
+
+        if teams_window_just_dropped or zoom_window_just_dropped:
+            logger.info("CallScorer: call window disappeared — fast-ending, resetting decay timer.")
+            self.audio_watcher.reset_decay_timer()
+            self._consecutive_inactive_polls = CALL_END_GRACE_POLLS + 1
+            self._consecutive_active_polls = 0
+
+        self._prev_teams_window = proc.teams_call_window_detected
+        self._prev_zoom_window = proc.zoom_call_window_detected
+
+        above_threshold = total_score >= CALL_SCORE_THRESHOLD
+        held_by_window = prev_active and self._call_should_be_held(proc)
+
+        if above_threshold or held_by_window:
             self._consecutive_active_polls += 1
             self._consecutive_inactive_polls = 0
         else:
@@ -135,7 +169,20 @@ class CallScorer:
                 self._history.append(new_state)
 
         elif prev_active and self._consecutive_inactive_polls <= CALL_END_GRACE_POLLS:
-            new_state = self._current_state  # hold during grace
+            new_state = CallState(
+                call_active=True,
+                app_name=self._current_state.app_name,
+                all_active_apps=self._current_state.all_active_apps,
+                confidence=self._current_state.confidence,
+                score=total_score,
+                process_signals=proc.to_dict(),
+                audio_signals=audio.to_dict(),
+                detected_at=self._current_state.detected_at,
+            )
+            logger.debug(
+                "CallScorer: score dropped, grace period (%d/%d polls) — holding.",
+                self._consecutive_inactive_polls, CALL_END_GRACE_POLLS
+            )
 
         else:
             if prev_active:
@@ -170,6 +217,7 @@ class CallScorer:
             "above_threshold": total_score >= CALL_SCORE_THRESHOLD,
             "consecutive_active_polls": self._consecutive_active_polls,
             "consecutive_inactive_polls": self._consecutive_inactive_polls,
+            "grace_period_polls": CALL_END_GRACE_POLLS,
             "duration_gate_required": DURATION_GATE_POLLS,
             "process_signals": proc.to_dict(),
             "audio_signals": audio.to_dict(),
