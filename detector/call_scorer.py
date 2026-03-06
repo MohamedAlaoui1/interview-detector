@@ -107,8 +107,8 @@ class CallScorer:
         now = time.time()
         prev_active = self._current_state.call_active
 
-        # Fast-end: call window title just disappeared → end immediately,
-        # don't wait for decay timer (120s) or grace period (30s).
+        # Fast-end: call window title just disappeared.
+        # End the call THIS poll — bypass grace period and decay timer entirely.
         teams_window_just_dropped = (
             prev_active
             and self._current_state.app_name == "Microsoft Teams"
@@ -122,15 +122,26 @@ class CallScorer:
             and not proc.zoom_call_window_detected
         )
 
-        if teams_window_just_dropped or zoom_window_just_dropped:
-            logger.info("CallScorer: call window disappeared — fast-ending, resetting decay timer.")
-            self.audio_watcher.reset_decay_timer()
-            self._consecutive_inactive_polls = CALL_END_GRACE_POLLS + 1
-            self._consecutive_active_polls = 0
-
         self._prev_teams_window = proc.teams_call_window_detected
         self._prev_zoom_window = proc.zoom_call_window_detected
 
+        if teams_window_just_dropped or zoom_window_just_dropped:
+            logger.info("CallScorer: call window disappeared — ending call immediately.")
+            self.audio_watcher.reset_decay_timer()
+            self._consecutive_active_polls = 0
+            self._consecutive_inactive_polls = 0
+            logger.info("CallScorer: Call ENDED — score=%d", total_score)
+            new_state = CallState(
+                call_active=False,
+                score=total_score,
+                process_signals=proc.to_dict(),
+                audio_signals=audio.to_dict(),
+                ended_at=now,
+            )
+            self._current_state = new_state
+            return new_state
+
+        # Normal flow below
         above_threshold = total_score >= CALL_SCORE_THRESHOLD
         held_by_window = prev_active and self._call_should_be_held(proc)
 
