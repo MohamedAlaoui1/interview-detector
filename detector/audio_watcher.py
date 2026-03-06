@@ -24,7 +24,7 @@ import psutil
 
 logger = logging.getLogger(__name__)
 
-NETWORK_SPIKE_THRESHOLD: float = 500_000       # 500 KB/s — single poll trigger
+NETWORK_SPIKE_THRESHOLD: float = 500_000       # 500 KB/s — single poll trigger halawah
 NETWORK_ROLLING_THRESHOLD: float = 200_000     # 200 KB/s — rolling avg must also exceed this
 NETWORK_DECAY_SECS: float = 120.0              # 2 minutes — covers silent pauses in calls
 NETWORK_ROLLING_POLLS: int = 4                 # ~12 seconds of history
